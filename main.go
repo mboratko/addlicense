@@ -60,6 +60,7 @@ var (
 	year      = flag.String("y", fmt.Sprint(time.Now().Year()), "copyright year(s)")
 	verbose   = flag.Bool("v", false, "verbose mode: print the name of the files that are modified or were skipped")
 	checkonly = flag.Bool("check", false, "check only mode: verify presence of license headers and exit with non-zero code if missing")
+	ignoreEmpty = flag.Bool("ignore-empty", false, "ignore empty files")
 )
 
 func init() {
@@ -153,35 +154,64 @@ func main() {
 		for f := range ch {
 			f := f // https://golang.org/doc/faq#closures_and_goroutines
 			wg.Go(func() error {
+				// Check if file extension is known
+				lic, err := licenseHeader(f.path, t, data)
+				if err != nil { return err }
+				if lic == nil { // Unknown fileExtension
+					if *verbose {
+						log.Printf("skipping: %s (unknown extension)", f.path)
+					}
+					return nil
+				}
+
+				// Load the file
+				filedata, err := ioutil.ReadFile(f.path)
+				if err != nil { return err }
+
+				// Check if file is empty
+				if *ignoreEmpty && isEmpty(filedata) {
+					if *verbose {
+						log.Printf("skipping: %s (empty)", f.path)
+					}
+					return nil
+				}
+
+				// Check if file has a license
+				if hasLicense(filedata) {
+					if *verbose {
+						log.Printf("skipping: %s (has license)", f.path)
+					}
+					return nil
+				}
+
+				// Check if file was generated
+				if isGenerated(filedata) {
+					if *verbose {
+						log.Printf("skipping: %s (generated)", f.path)
+					}
+					return nil
+				}
+				
+				// Now we either report if the file is missing a license header, or we modify it
 				if *checkonly {
-					// Check if file extension is known
-					lic, err := licenseHeader(f.path, t, data)
-					if err != nil {
-						log.Printf("%s: %v", f.path, err)
-						return err
+					fmt.Printf("%s\n", f.path)
+					return errors.New("missing license header")
+				}
+
+				// If we have not returned by this point, we modify it
+				line := hashBang(filedata)
+				if len(line) > 0 {
+					filedata = filedata[len(line):]
+					if line[len(line)-1] != '\n' {
+						line = append(line, '\n')
 					}
-					if lic == nil { // Unknown fileExtension
-						return nil
-					}
-					// Check if file has a license
-					hasLicense, err := fileHasLicense(f.path)
-					if err != nil {
-						log.Printf("%s: %v", f.path, err)
-						return err
-					}
-					if !hasLicense {
-						fmt.Printf("%s\n", f.path)
-						return errors.New("missing license header")
-					}
-				} else {
-					modified, err := addLicense(f.path, f.mode, t, data)
-					if err != nil {
-						log.Printf("%s: %v", f.path, err)
-						return err
-					}
-					if *verbose && modified {
-						log.Printf("%s modified", f.path)
-					}
+					lic = append(line, lic...)
+				}
+				filedata = append(lic, filedata...)
+				ioutil.WriteFile(f.path, filedata, f.mode)
+
+				if *verbose {
+					log.Printf("modified: %s", f.path)
 				}
 				return nil
 			})
@@ -237,47 +267,6 @@ func fileMatches(path string, patterns []string) bool {
 		}
 	}
 	return false
-}
-
-// addLicense add a license to the file if missing.
-//
-// It returns true if the file was updated.
-func addLicense(path string, fmode os.FileMode, tmpl *template.Template, data licenseData) (bool, error) {
-	var lic []byte
-	var err error
-	lic, err = licenseHeader(path, tmpl, data)
-	if err != nil || lic == nil {
-		return false, err
-	}
-
-	b, err := ioutil.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	if hasLicense(b) || isGenerated(b) {
-		return false, err
-	}
-
-	line := hashBang(b)
-	if len(line) > 0 {
-		b = b[len(line):]
-		if line[len(line)-1] != '\n' {
-			line = append(line, '\n')
-		}
-		lic = append(line, lic...)
-	}
-	b = append(lic, b...)
-	return true, ioutil.WriteFile(path, b, fmode)
-}
-
-// fileHasLicense reports whether the file at path contains a license header.
-func fileHasLicense(path string) (bool, error) {
-	b, err := ioutil.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	// If generated, we count it as if it has a license.
-	return hasLicense(b) || isGenerated(b), nil
 }
 
 // licenseHeader populates the provided license template with data, and returns
@@ -375,4 +364,9 @@ func hasLicense(b []byte) bool {
 	return bytes.Contains(bytes.ToLower(b[:n]), []byte("copyright")) ||
 		bytes.Contains(bytes.ToLower(b[:n]), []byte("mozilla public")) ||
 		bytes.Contains(bytes.ToLower(b[:n]), []byte("spdx-license-identifier"))
+}
+
+// isEmpty returs true if the file, after removing whitespace, is empty
+func isEmpty(b []byte) bool {
+	return len(bytes.TrimSpace(b))==0
 }
